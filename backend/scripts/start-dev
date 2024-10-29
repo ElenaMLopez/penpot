@@ -10,6 +10,7 @@ export PENPOT_FLAGS="\
        enable-webhooks \
        enable-backend-asserts \
        enable-audit-log \
+       enable-login-with-ldap \
        enable-transit-readable-response \
        enable-demo-users \
        enable-feature-fdata-pointer-map \
