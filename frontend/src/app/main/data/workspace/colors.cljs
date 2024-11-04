@@ -625,13 +625,17 @@
       (let [stopper (rx/merge
                      (rx/filter (ptk/type? ::finalize-colorpicker) stream)
                      (rx/filter (ptk/type? ::initialize-colorpicker) stream))]
-
         (->> (rx/merge
               (->> stream
                    (rx/filter (ptk/type? ::update-colorpicker-gradient))
-                   (rx/debounce 200))
+                   (rx/debounce 20))
               (rx/filter (ptk/type? ::update-colorpicker-color) stream)
-              (rx/filter (ptk/type? ::activate-colorpicker-gradient) stream))
+              (->> (rx/filter (ptk/type? ::activate-colorpicker-gradient) stream)
+                   (rx/debounce 20))
+              (rx/filter (ptk/type? ::update-colorpicker-stops) stream)
+              (rx/filter (ptk/type? ::update-colorpicker-add-stop) stream)
+              (rx/filter (ptk/type? ::update-colorpicker-add-auto) stream))
+             (rx/debounce 40)
              (rx/map (constantly (colorpicker-onchange-runner on-change)))
              (rx/take-until stopper))))
 
@@ -662,7 +666,7 @@
                       (let [stop  (or (:editing-stop state) 0)
                             stops (mapv split-color-components (:stops gradient))]
                         (-> state
-                            (assoc :current-color (nth stops stop))
+                            (assoc :current-color (get stops stop))
                             (assoc :stops stops)
                             (assoc :gradient (-> gradient
                                                  (dissoc :stops)
@@ -677,6 +681,122 @@
                           (dissoc :editing-stop)
                           (dissoc :gradient)
                           (dissoc :stops))))))))))
+
+(defn update-colorpicker-add-auto
+  []
+  (ptk/reify ::update-colorpicker-add-auto
+    ptk/UpdateEvent
+    (update [_ state]
+      (update state :colorpicker
+              (fn [{:keys [stops editing-stop] :as state}]
+                (if (cc/uniform-spread? stops)
+                  ;; Add to uniform
+                  (let [stops (->> (cc/uniform-spread (first stops) (last stops) (inc (count stops)))
+                                   (mapv split-color-components))]
+                    (-> state
+                        (assoc :current-color (get stops editing-stop))
+                        (assoc :stops stops)))
+
+                  ;; We add the stop to the middle point between the selected
+                  ;; and the next one.
+                  ;; If the last stop is selected then it's added between the
+                  ;; last two stops.
+                  (let [index
+                        (if (= editing-stop (dec (count stops)))
+                          (dec editing-stop)
+                          editing-stop)
+
+                        {from-offset :offset} (get stops index)
+                        {to-offset :offset}   (get stops (inc index))
+
+                        half-point-offset
+                        (+ from-offset (/ (- to-offset from-offset) 2))
+
+                        new-stop (-> (cc/interpolate-gradient stops half-point-offset)
+                                     (split-color-components))
+
+                        stops (conj stops new-stop)
+                        stops (into [] (sort-by :offset stops))
+                        editing-stop (d/index-of-pred stops #(= new-stop %))]
+                    (-> state
+                        (assoc :editing-stop editing-stop)
+                        (assoc :current-color (get stops editing-stop))
+                        (assoc :stops stops)))))))))
+
+(defn update-colorpicker-add-stop
+  [offset]
+  (ptk/reify ::update-colorpicker-add-stop
+    ptk/UpdateEvent
+    (update [_ state]
+      (update state :colorpicker
+              (fn [state]
+                (let [stops (:stops state)
+                      new-stop (-> (cc/interpolate-gradient stops offset)
+                                   (split-color-components))
+                      stops (conj stops new-stop)
+                      stops (into [] (sort-by :offset stops))
+                      editing-stop (d/index-of-pred stops #(= new-stop %))]
+                  (-> state
+                      (assoc :editing-stop editing-stop)
+                      (assoc :current-color (get stops editing-stop))
+                      (assoc :stops stops))))))))
+
+(defn update-colorpicker-stops
+  [stops]
+  (ptk/reify ::update-colorpicker-stops
+    ptk/UpdateEvent
+    (update [_ state]
+      (update state :colorpicker
+              (fn [state]
+                (let [stop  (or (:editing-stop state) 0)
+                      stops (mapv split-color-components stops)]
+                  (-> state
+                      (assoc :current-color (get stops stop))
+                      (assoc :stops stops))))))))
+
+(defn sort-colorpicker-stops
+  []
+  (ptk/reify ::sort-colorpicker-stops
+    ptk/UpdateEvent
+    (update [_ state]
+      (update state :colorpicker
+              (fn [state]
+                (let [stop     (or (:editing-stop state) 0)
+                      stops    (mapv split-color-components (:stops state))
+                      stop-val (get stops stop)
+                      stops    (into [] (sort-by :offset stops))
+                      stop     (d/index-of-pred stops #(= % stop-val))]
+                  (-> state
+                      (assoc :editing-stop stop)
+                      (assoc :stops stops))))))))
+
+(defn remove-gradient-stop
+  ([]
+   (remove-gradient-stop nil))
+
+  ([index]
+   (ptk/reify ::remove-gradient-stop
+     ptk/UpdateEvent
+     (update [_ state]
+       (update state :colorpicker
+               (fn [{:keys [editing-stop stops] :as state}]
+                 (if (> (count stops) 2)
+                   (let [delete-index (or index editing-stop 0)
+                         delete-stop  (get stops delete-index)
+                         stops (into [] (remove #(= delete-stop %)) stops)
+
+                         editing-stop
+                         (cond
+                           (< editing-stop delete-index) editing-stop
+                           (> editing-stop delete-index) (dec editing-stop)
+                           (>= (count stops) editing-stop) (dec (count stops))
+                           :else editing-stop)]
+                     (-> state
+                         (assoc :editing-stop editing-stop)
+                         (assoc :stops stops)))
+
+                   ;; Cannot delete
+                   state)))))))
 
 (defn update-colorpicker-color
   [changes add-recent?]
@@ -723,16 +843,16 @@
       (update-in state [:colorpicker :gradient] merge changes))))
 
 (defn select-colorpicker-gradient-stop
-  [stop]
+  [index]
   (ptk/reify ::select-colorpicket-gradient-stop
     ptk/UpdateEvent
     (update [_ state]
       (update state :colorpicker
               (fn [state]
-                (if-let [color (get-in state [:stops stop])]
+                (if-let [color (get-in state [:stops index])]
                   (assoc state
                          :current-color color
-                         :editing-stop stop)
+                         :editing-stop index)
                   state))))))
 
 (defn activate-colorpicker-color
