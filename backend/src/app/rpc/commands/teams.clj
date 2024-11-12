@@ -265,6 +265,7 @@
    [:fn #(or (contains? % :team-id)
              (contains? % :file-id))]])
 
+;; FIXME: split in two separated requests
 (sv/defmethod ::get-team-users
   "Get team users by team-id or by file-id"
   {::doc/added "1.17"
@@ -302,20 +303,29 @@
     inner join project as p on (f.project_id = p.id)
     where p.team_id = ?")
 
-(def sql:team-by-file
-  "select p.team_id as id
-     from project as p
-     join file as f on (p.id = f.project_id)
-    where f.id = ?")
-
 (defn get-users
   [conn team-id]
   (db/exec! conn [sql:team-users team-id team-id team-id]))
 
+(def sql:get-team-by-file
+  "SELECT t.*
+     FROM team AS t
+     JOIN project AS p ON (p.team_id = t.id)
+     JOIN file AS f ON (f.project_id = p.id)
+    WHERE f.id = ?")
+
 (defn get-team-for-file
   [conn file-id]
-  (->> [sql:team-by-file file-id]
-       (db/exec-one! conn)))
+  (let [team (->> (db/exec! conn [sql:get-team-by-file file-id])
+                  (remove db/is-row-deleted?)
+                  (map decode-row)
+                  (first))]
+    (when-not team
+      (ex/raise :type :not-found
+                :code :object-not-found
+                :hint "database object not found"))
+
+    team))
 
 ;; --- Query: Team Stats
 
@@ -1155,32 +1165,43 @@
 
 ;; --- Mutation: Request Team Invitation
 
-(def sql:upsert-team-access-request
-  "INSERT INTO team_access_request (id, team_id, requester_id, valid_until, auto_join_until)
-   VALUES (?, ?, ?, ?, ?)
-       ON conflict(id)
-       DO UPDATE SET valid_until = ?, auto_join_until = ?, updated_at = now()
-   RETURNING *")
+(def sql:get-team-owner
+  "SELECT p.*
+     FROM profile AS p
+     JOIN team_profile_rel AS tpr ON (tpr.profile_id = p.id)
+    WHERE tpr.team_id = ?
+      AND tpr.is_owner true")
 
+(defn- get-team-owner
+  "Return a complete profile of the team owner"
+  [conn team-id]
+  (->> (db/exec! conn [sql:get-team-owner team-id])
+       (remove db/is-row-deleted?)
+       (map profile/decode-row)
+       (first)))
 
-(def sql:team-access-request
+(def sql:get-team-access-request
   "SELECT id, (valid_until < now()) AS expired
      FROM team_access_request
     WHERE team_id = ?
       AND requester_id = ?")
 
-(def sql:team-owner
-  "SELECT profile_id
-     FROM team_profile_rel
-    WHERE team_id = ?
-      AND is_owner = true")
+(defn- get-existing-access-request
+  [conn team-id requester-id]
+  (->> (db/exec-one! conn [sql:get-team-access-request team-id requester-id])
+       (decode-row)))
 
+(def sql:upsert-team-access-request
+  "INSERT INTO team_access_request (id, team_id, requester_id, valid_until, auto_join_until)
+   VALUES (?, ?, ?, ?, ?)
+       ON conflict(team_id, requester_id)
+       DO UPDATE SET valid_until = ?, auto_join_until = ?, updated_at = now()
+   RETURNING *")
 
 (defn- create-team-access-request
-  [{:keys [::db/conn] :as cfg} {:keys [team requester team-owner file is-viewer] :as params}]
-  (let [old-request (->> (db/exec-one! conn [sql:team-access-request (:id team) (:id requester)])
-                         (decode-row))]
-    (when (false? (:expired old-request))
+  [{:keys [::db/conn] :as cfg} {:keys [team requester team-owner file is-viewer]}]
+  (let [old-request (get-existing-access-request conn (:id team) (:id requester))]
+    (when-not (:expired old-request)
       (ex/raise :type :validation
                 :code :request-already-sent
                 :hint "you have already made a request to join this team less than 24 hours ago"))
@@ -1220,6 +1241,18 @@
       request)))
 
 
+(defn- get-file-for-team-access-request
+  "A specific method for obtain a file with name and page-id used for
+  team request access procediment"
+  [conn file-id]
+  (let [file (-> (db/get conn :file
+                         {:id file-id}
+                         {::sql/columns [:id :name :deleted-at :data]})
+                 (update :data blob/decode))]
+    (-> file
+        (dissoc :data)
+        (assoc :page-id (-> file :data :pages first)))))
+
 (def ^:private schema:create-team-access-request
   [:and
    [:map {:title "create-team-access-request"}
@@ -1231,7 +1264,6 @@
           (or (contains? params :file-id)
               (contains? params :team-id)))]])
 
-
 (sv/defmethod ::create-team-access-request
   "A rpc call that allow to request for an invitations to join the team."
   {::doc/added "2.2.0"
@@ -1240,29 +1272,21 @@
 
   (db/tx-run! cfg
               (fn [{:keys [::db/conn] :as cfg}]
+                (let [requester  (profile/get-profile conn profile-id)
+                      team       (if team-id
+                                   (->> (db/get-by-id conn :team team-id)
+                                        (decode-row))
+                                   (get-team-for-file conn file-id))
 
-                (let [requester     (db/get-by-id conn :profile profile-id)
-                      team-id       (if (some? team-id)
-                                      team-id
-                                      (:id (get-team-for-file conn file-id)))
-                      team          (db/get-by-id conn :team team-id)
-                      owner-id      (->> (db/exec! conn [sql:team-owner (:id team)])
-                                         (map decode-row)
-                                         (first)
-                                         :profile-id)
-                      team-owner    (db/get-by-id conn :profile owner-id)
-                      file          (when (some? file-id)
-                                      (db/get* conn :file
+                      team-owner (get-team-owner conn team-id)
+
+                      file       (when (some? file-id)
+                                   (-> (db/get conn :file
                                                {:id file-id}
-                                               {::sql/columns [:id :name :data]}))
-                      file          (when (some? file)
-                                      (assoc file :data (blob/decode (:data file))))]
+                                               {::sql/columns [:id :name :deleted-at :data]})
+                                       (update :data blob/decode)))]
 
-                  ;;TODO needs quotes?
-
-                  (when (or (nil? requester) (nil? team) (nil? team-owner) (and (some? file-id) (nil? file)))
-                    (ex/raise :type :validation
-                              :code :invalid-parameters))
+                  ;; FIXME missing quotes
 
                   ;; Check that the requester is not muted
                   (check-profile-muted conn requester)
@@ -1271,8 +1295,12 @@
                   (check-email-bounce conn (:email team-owner) false)
                   (check-email-spam conn (:email team-owner) true)
 
-                  (let [request (create-team-access-request
-                                 cfg {:team team :requester requester :team-owner team-owner :file file :is-viewer is-viewer})]
-                    (when request
-                      (with-meta {:request request}
-                        {::audit/props {:request 1}})))))))
+                  (let [params  {:team team
+                                 :requester requester
+                                 :team-owner team-owner
+                                 :file file
+                                 :is-viewer is-viewer}
+                        request (create-team-access-request cfg params)]
+
+                    (with-meta {:request request}
+                      {::audit/props {:request 1}}))))))
